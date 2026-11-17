@@ -59,6 +59,10 @@ const (
 	defaultPasswordDatabase      = "postgres"
 	defaultMongoPasswordUser     = "root"
 	defaultMongoPasswordDatabase = "admin"
+	defaultMySQLPasswordUser     = "root"
+	defaultMySQLPasswordDatabase = "mysql"
+	defaultRedisPasswordUser     = "default"
+	defaultRedisPasswordDatabase = "0"
 
 	passwordExecutionModeJob  = "job"
 	passwordExecutionModeExec = "exec"
@@ -97,9 +101,9 @@ func NewChangePasswordOptions(f cmdutil.Factory, streams genericiooptions.IOStre
 
 func (o *ChangePasswordOptions) AddFlags(cmd *cobra.Command) {
 	o.AccountBaseOptions.AddFlags(cmd)
-	cmd.Flags().StringVar(&o.UserName, "name", "", "Specify the database account whose password should be changed. Defaults to postgres for PostgreSQL and root for MongoDB.")
+	cmd.Flags().StringVar(&o.UserName, "name", "", "Specify the database account whose password should be changed. Defaults to postgres for PostgreSQL, root for MongoDB and MySQL, and default for Redis.")
 	cmd.Flags().StringVarP(&o.Password, "password", "p", "", "Specify the new password; prompts interactively when omitted.")
-	cmd.Flags().StringVar(&o.DatabaseName, "database", "", "Database used for authentication and the password change. Defaults to postgres for PostgreSQL and admin for MongoDB.")
+	cmd.Flags().StringVar(&o.DatabaseName, "database", "", "Database used for authentication and the password change. Defaults to postgres for PostgreSQL, admin for MongoDB, mysql for MySQL, and 0 for Redis.")
 	cmd.Flags().StringVar(&o.SecretName, "secret", "", "Secret to update; when omitted, all related account Secrets are detected and updated.")
 	cmd.Flags().StringVar(&o.AuthSecretName, "auth-secret", "", "Secret used for database login; defaults to the target Secret.")
 	cmd.Flags().DurationVar(&o.AccountRootSecretWaitTimeout, "account-root-secret-timeout", defaultMongoAccountRootSecretWaitTimeout, "Maximum time to wait for a MongoDB account-root Secret to be deleted and recreated.")
@@ -256,11 +260,12 @@ func (o *ChangePasswordOptions) Run() error {
 	}
 
 	request := passwordChangeRequest{
-		PodName:      o.PodName,
-		AuthUser:     o.authUser,
-		AuthPassword: o.authPassword,
-		TargetUser:   o.UserName,
-		NewPassword:  o.Password,
+		PodName:           o.PodName,
+		AuthUser:          o.authUser,
+		AuthPassword:      o.authPassword,
+		TargetUser:        o.UserName,
+		TargetOldPassword: o.oldPassword,
+		NewPassword:       o.Password,
 	}
 	if err := o.passwordChanger.ChangePassword(request); err != nil {
 		o.printGeneralInfo("fail", err.Error())
@@ -289,11 +294,12 @@ func (o *ChangePasswordOptions) Run() error {
 				rollbackAuthPassword = o.Password
 			}
 			rollbackErr := o.passwordChanger.ChangePassword(passwordChangeRequest{
-				PodName:      o.PodName,
-				AuthUser:     o.authUser,
-				AuthPassword: rollbackAuthPassword,
-				TargetUser:   o.UserName,
-				NewPassword:  o.oldPassword,
+				PodName:           o.PodName,
+				AuthUser:          o.authUser,
+				AuthPassword:      rollbackAuthPassword,
+				TargetUser:        o.UserName,
+				TargetOldPassword: o.Password,
+				NewPassword:       o.oldPassword,
 			})
 			restoreErr := o.restorePasswordSecrets(context.Background(), updatedSecrets)
 			if rollbackErr != nil {
@@ -306,9 +312,11 @@ func (o *ChangePasswordOptions) Run() error {
 		}
 		updatedSecrets = append(updatedSecrets, targetSecret)
 	}
-	if err := o.ensureMongoAccountRootRecreationSource(context.Background(), immutableSecrets); err != nil {
-		o.printGeneralInfo("fail", err.Error())
-		return fmt.Errorf("password changed, but failed to prepare MongoDB account-root Secret recreation: %w", err)
+	if isMongoCharacterType(o.CharType) {
+		if err := o.ensureMongoAccountRootRecreationSource(context.Background(), immutableSecrets); err != nil {
+			o.printGeneralInfo("fail", err.Error())
+			return fmt.Errorf("password changed, but failed to prepare MongoDB account-root Secret recreation: %w", err)
+		}
 	}
 	deletedImmutableSecrets := make([]*corev1.Secret, 0, len(immutableSecrets))
 	stuckAccountRootSecrets := make([]*corev1.Secret, 0, len(immutableSecrets))
@@ -317,9 +325,11 @@ func (o *ChangePasswordOptions) Run() error {
 			o.printGeneralInfo("fail", err.Error())
 			return fmt.Errorf("password changed and mutable target Secrets were updated, but failed to delete immutable Secret %s/%s for KubeBlocks to recreate: %w", o.Namespace, targetSecret.Name, err)
 		}
-		if err := o.waitForMongoAccountRootSecret(targetSecret); err != nil {
-			stuckAccountRootSecrets = append(stuckAccountRootSecrets, targetSecret)
-			continue
+		if isMongoCharacterType(o.CharType) {
+			if err := o.waitForMongoAccountRootSecret(targetSecret); err != nil {
+				stuckAccountRootSecrets = append(stuckAccountRootSecrets, targetSecret)
+				continue
+			}
 		}
 		deletedImmutableSecrets = append(deletedImmutableSecrets, targetSecret)
 	}
@@ -462,11 +472,12 @@ func validatePassword(password string) error {
 }
 
 type passwordChangeRequest struct {
-	PodName      string
-	AuthUser     string
-	AuthPassword string
-	TargetUser   string
-	NewPassword  string
+	PodName           string
+	AuthUser          string
+	AuthPassword      string
+	TargetUser        string
+	TargetOldPassword string
+	NewPassword       string
 }
 
 type passwordChanger interface {
@@ -501,6 +512,12 @@ var passwordChangerFactories = map[string]passwordChangerFactory{
 	},
 	"mongodb": func(config passwordChangerConfig) passwordChanger {
 		return &mongoPasswordChanger{config: config}
+	},
+	"mysql": func(config passwordChangerConfig) passwordChanger {
+		return &mysqlPasswordChanger{config: config}
+	},
+	"redis": func(config passwordChangerConfig) passwordChanger {
+		return &redisPasswordChanger{config: config}
 	},
 }
 
@@ -587,7 +604,7 @@ func findTargetPasswordSecrets(ctx context.Context, client kubernetes.Interface,
 	}
 
 	accountName := strings.ReplaceAll(user, "_", "-")
-	if strings.EqualFold(user, defaultPasswordUser) || strings.EqualFold(user, defaultMongoPasswordUser) {
+	if isDefaultConnectionCredentialUser(user) {
 		addCandidate(cluster + "-conn-credential")
 	}
 	addCandidate(cluster + "-" + component + "-account-" + accountName)
@@ -642,8 +659,7 @@ func selectPasswordPod(pods []corev1.Pod, cluster, component string) (*corev1.Po
 		if pod.Status.Phase != corev1.PodRunning || !passwordPodMatchesComponent(pod, cluster, component) {
 			continue
 		}
-		role := pod.Labels[constant.RoleLabelKey]
-		if role == "primary" || role == "leader" {
+		if isPrimaryPasswordPodRole(pod.Labels[constant.RoleLabelKey]) {
 			preferred = append(preferred, pod)
 		} else {
 			fallback = append(fallback, pod)
@@ -668,17 +684,42 @@ func selectPasswordPod(pods []corev1.Pod, cluster, component string) (*corev1.Po
 }
 
 func defaultPasswordUserForCharacterType(characterType string) string {
-	if isMongoCharacterType(characterType) {
+	switch {
+	case isMongoCharacterType(characterType):
 		return defaultMongoPasswordUser
+	case strings.EqualFold(characterType, "mysql"):
+		return defaultMySQLPasswordUser
+	case strings.EqualFold(characterType, "redis"):
+		return defaultRedisPasswordUser
+	default:
+		return defaultPasswordUser
 	}
-	return defaultPasswordUser
 }
 
 func defaultPasswordDatabaseForCharacterType(characterType string) string {
-	if isMongoCharacterType(characterType) {
+	switch {
+	case isMongoCharacterType(characterType):
 		return defaultMongoPasswordDatabase
+	case strings.EqualFold(characterType, "mysql"):
+		return defaultMySQLPasswordDatabase
+	case strings.EqualFold(characterType, "redis"):
+		return defaultRedisPasswordDatabase
+	default:
+		return defaultPasswordDatabase
 	}
-	return defaultPasswordDatabase
+}
+
+func isDefaultConnectionCredentialUser(user string) bool {
+	return strings.EqualFold(user, defaultPasswordUser) ||
+		strings.EqualFold(user, defaultMongoPasswordUser) ||
+		strings.EqualFold(user, defaultMySQLPasswordUser) ||
+		strings.EqualFold(user, defaultRedisPasswordUser)
+}
+
+func isPrimaryPasswordPodRole(role string) bool {
+	return strings.EqualFold(role, "primary") ||
+		strings.EqualFold(role, "leader") ||
+		strings.EqualFold(role, "master")
 }
 
 func databaseTypeName(characterType string) string {

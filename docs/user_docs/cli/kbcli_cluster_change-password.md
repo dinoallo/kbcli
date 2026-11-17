@@ -8,7 +8,7 @@ When automatically discovered account Secrets are immutable, kbcli deletes them 
 
 By default, the database statement is run by a short-lived Kubernetes Job that reuses the selected database container image. Its script is stored in a temporary Secret and deleted after the Job finishes. Users who already have `pods/exec` permission can select the legacy exec channel with `--executor exec`; the default is `--executor job` and does not use `pods/exec`.
 
-The cluster and selected component must be in the `Running` phase. For PostgreSQL, kbcli verifies that the server is not in recovery mode before changing the password. For MongoDB, kbcli checks connectivity and verifies that the selected server is a writable primary.
+The cluster and selected component must be in the `Running` phase. For PostgreSQL, kbcli verifies that the server is not in recovery mode before changing the password. For MongoDB, kbcli checks connectivity and verifies that the selected server is a writable primary. MySQL and Redis changes use the automatically selected primary, leader, or master instance unless `--instance` is specified.
 
 ```
 kbcli cluster change-password [flags]
@@ -21,6 +21,8 @@ kbcli cluster change-password [flags]
   kbcli cluster change-password CLUSTERNAME
   # change the default MongoDB root password and update its Secret
   kbcli cluster change-password CLUSTERNAME --password PASSWD
+  # change the default MySQL root or Redis default password and update its Secret
+  kbcli cluster change-password CLUSTERNAME --password PASSWD
   # change an application role password with explicit Secrets
   kbcli cluster change-password CLUSTERNAME --component COMPNAME --name USERNAME --password PASSWD --secret TARGET_SECRET --auth-secret ADMIN_SECRET
   # change a password on a specified instance
@@ -30,18 +32,17 @@ kbcli cluster change-password [flags]
 ### Options
 
 ```
-      --auth-secret string   Secret used for database login; defaults to the target Secret.
-      --account-root-secret-timeout duration
-                              Maximum time to wait for a MongoDB account-root Secret to be deleted and recreated. (default 30s)
-      --component string     Specify the name of component to be connected. If not specified, pick the first one.
-      --container string     Container whose image is used by the temporary password Job; defaults to the Pod's default container.
-      --database string      Database used for authentication and the password change. Defaults to postgres for PostgreSQL and admin for MongoDB.
-      --executor string      Executor used to run the database command: job or exec (default "job")
-  -h, --help                 help for change-password
-  -i, --instance string      Specify the name of instance to be connected.
-      --name string          Specify the database account whose password should be changed. Defaults to postgres for PostgreSQL and root for MongoDB.
-  -p, --password string      Specify the new password; prompts interactively when omitted.
-      --secret string        Secret to update; when omitted, all related account Secrets are detected and updated.
+      --account-root-secret-timeout duration   Maximum time to wait for a MongoDB account-root Secret to be deleted and recreated. (default 30s)
+      --auth-secret string                     Secret used for database login; defaults to the target Secret.
+      --component string                       Specify the name of component to be connected. If not specified, pick the first one.
+      --container string                       Container used to run the database command or whose image is used by the temporary password Job; defaults to the Pod's default container.
+      --database string                        Database used for authentication and the password change. Defaults to postgres for PostgreSQL, admin for MongoDB, mysql for MySQL, and 0 for Redis.
+      --executor string                        Executor used to run the database command: job or exec. The exec mode requires pods/exec permission. (default "job")
+  -h, --help                                   help for change-password
+  -i, --instance string                        Specify the name of instance to be connected.
+      --name string                            Specify the database account whose password should be changed. Defaults to postgres for PostgreSQL, root for MongoDB and MySQL, and default for Redis.
+  -p, --password string                        Specify the new password; prompts interactively when omitted.
+      --secret string                          Secret to update; when omitted, all related account Secrets are detected and updated.
 ```
 
 ### Options inherited from parent commands

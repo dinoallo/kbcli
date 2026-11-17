@@ -54,6 +54,14 @@ func TestBuildPostgresPasswordSQL(t *testing.T) {
 	}
 }
 
+func TestBuildMySQLPasswordSQL(t *testing.T) {
+	got := buildMySQLPasswordSQL(`role"name`, `p'ass\word`)
+	want := "SET SESSION sql_mode = CONCAT(@@session.sql_mode, ',NO_BACKSLASH_ESCAPES');\nALTER USER 'role\"name'@'%' IDENTIFIED BY 'p''ass\\word';\n"
+	if got != want {
+		t.Fatalf("buildMySQLPasswordSQL() = %q, want %q", got, want)
+	}
+}
+
 func TestPromptPassword(t *testing.T) {
 	streams, _, _, _ := genericiooptions.NewTestIOStreams()
 	var output bytes.Buffer
@@ -111,6 +119,21 @@ func TestSelectPasswordPodPrefersPrimary(t *testing.T) {
 	}
 }
 
+func TestSelectPasswordPodPrefersMasterRole(t *testing.T) {
+	pods := []corev1.Pod{
+		passwordTestPod("pg-redis-1", "secondary", "redis"),
+		passwordTestPod("pg-redis-0", "master", "redis"),
+	}
+
+	got, err := selectPasswordPod(pods, "pg", "redis")
+	if err != nil {
+		t.Fatalf("selectPasswordPod() error = %v", err)
+	}
+	if got.Name != "pg-redis-0" {
+		t.Fatalf("selectPasswordPod() = %q, want %q", got.Name, "pg-redis-0")
+	}
+}
+
 func TestSelectPasswordPodRejectsAmbiguousFallback(t *testing.T) {
 	pods := []corev1.Pod{
 		passwordTestPod("pg-postgresql-0", "", "postgresql"),
@@ -163,6 +186,32 @@ func TestFindTargetPasswordSecretsUsesMongoConnectionAndAccountSecrets(t *testin
 	}
 }
 
+func TestFindTargetPasswordSecretUsesMySQLConnectionSecret(t *testing.T) {
+	secret := passwordTestSecret("mysql-conn-credential", "root", "old-password")
+	client := fake.NewSimpleClientset(secret)
+
+	got, err := findTargetPasswordSecret(context.Background(), client, "default", "mysql", "mysql", "root", "")
+	if err != nil {
+		t.Fatalf("findTargetPasswordSecret() error = %v", err)
+	}
+	if got.Name != secret.Name {
+		t.Fatalf("findTargetPasswordSecret() = %q, want %q", got.Name, secret.Name)
+	}
+}
+
+func TestFindTargetPasswordSecretUsesRedisConnectionSecret(t *testing.T) {
+	secret := passwordTestSecret("redis-conn-credential", "default", "old-password")
+	client := fake.NewSimpleClientset(secret)
+
+	got, err := findTargetPasswordSecret(context.Background(), client, "default", "redis", "redis", "default", "")
+	if err != nil {
+		t.Fatalf("findTargetPasswordSecret() error = %v", err)
+	}
+	if got.Name != secret.Name {
+		t.Fatalf("findTargetPasswordSecret() = %q, want %q", got.Name, secret.Name)
+	}
+}
+
 func TestFindTargetPasswordSecretUsesAccountSecret(t *testing.T) {
 	secret := passwordTestSecret("pg-postgresql-account-app-user", "app_user", "old-password")
 	secret.Labels = map[string]string{
@@ -208,6 +257,9 @@ func TestChangePasswordRunUpdatesSecret(t *testing.T) {
 	}
 	if len(changer.requests) != 1 {
 		t.Fatalf("password change requests = %d, want 1", len(changer.requests))
+	}
+	if changer.requests[0].TargetOldPassword != "old-password" {
+		t.Fatalf("target old password = %q, want %q", changer.requests[0].TargetOldPassword, "old-password")
 	}
 	if changer.requests[0].NewPassword != "new-password" {
 		t.Fatalf("new password = %q, want %q", changer.requests[0].NewPassword, "new-password")
@@ -393,14 +445,35 @@ func TestChangePasswordRunRollsBackWhenSecretUpdateFails(t *testing.T) {
 	if changer.requests[1].AuthPassword != "admin-password" {
 		t.Fatalf("rollback auth password = %q, want %q", changer.requests[1].AuthPassword, "admin-password")
 	}
+	if changer.requests[1].TargetOldPassword != "new-password" {
+		t.Fatalf("rollback target old password = %q, want %q", changer.requests[1].TargetOldPassword, "new-password")
+	}
 	if changer.requests[1].NewPassword != "old-password" {
 		t.Fatalf("rollback new password = %q, want %q", changer.requests[1].NewPassword, "old-password")
 	}
 }
 
 func TestNewPasswordChangerRejectsUnsupportedDatabase(t *testing.T) {
-	if _, err := newPasswordChanger("mysql", passwordChangerConfig{}); err == nil {
+	if _, err := newPasswordChanger("oracle", passwordChangerConfig{}); err == nil {
 		t.Fatal("newPasswordChanger() should reject unsupported databases")
+	}
+}
+
+func TestNewPasswordChangerSupportsMySQLAndRedis(t *testing.T) {
+	mysqlChanger, err := newPasswordChanger("mysql", passwordChangerConfig{})
+	if err != nil {
+		t.Fatalf("newPasswordChanger(mysql) error = %v", err)
+	}
+	if _, ok := mysqlChanger.(*mysqlPasswordChanger); !ok {
+		t.Fatalf("newPasswordChanger(mysql) type = %T, want *mysqlPasswordChanger", mysqlChanger)
+	}
+
+	redisChanger, err := newPasswordChanger("redis", passwordChangerConfig{})
+	if err != nil {
+		t.Fatalf("newPasswordChanger(redis) error = %v", err)
+	}
+	if _, ok := redisChanger.(*redisPasswordChanger); !ok {
+		t.Fatalf("newPasswordChanger(redis) type = %T, want *redisPasswordChanger", redisChanger)
 	}
 }
 
@@ -428,6 +501,18 @@ func TestDefaultPasswordValuesForCharacterType(t *testing.T) {
 	}
 	if got := defaultPasswordDatabaseForCharacterType("postgresql"); got != defaultPasswordDatabase {
 		t.Fatalf("PostgreSQL default database = %q, want %q", got, defaultPasswordDatabase)
+	}
+	if got := defaultPasswordUserForCharacterType("mysql"); got != defaultMySQLPasswordUser {
+		t.Fatalf("MySQL default user = %q, want %q", got, defaultMySQLPasswordUser)
+	}
+	if got := defaultPasswordDatabaseForCharacterType("mysql"); got != defaultMySQLPasswordDatabase {
+		t.Fatalf("MySQL default database = %q, want %q", got, defaultMySQLPasswordDatabase)
+	}
+	if got := defaultPasswordUserForCharacterType("redis"); got != defaultRedisPasswordUser {
+		t.Fatalf("Redis default user = %q, want %q", got, defaultRedisPasswordUser)
+	}
+	if got := defaultPasswordDatabaseForCharacterType("redis"); got != defaultRedisPasswordDatabase {
+		t.Fatalf("Redis default database = %q, want %q", got, defaultRedisPasswordDatabase)
 	}
 }
 
@@ -637,6 +722,134 @@ func TestMongoPasswordChangerUsesTemporaryJobWithoutExec(t *testing.T) {
 	assertTemporaryPasswordResourcesDeleted(t, client, job.Name)
 }
 
+func TestMySQLPasswordChangerUsesTemporaryJobWithoutExec(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	completePasswordJobsImmediately(client)
+	pod := passwordTestPod("mysql-mysql-0", "leader", "mysql")
+	pod.Namespace = "default"
+	pod.Status.PodIP = "10.0.0.10"
+	pod.Spec.Containers = []corev1.Container{{Name: "mysql", Image: "apecloud/mysql:test"}}
+
+	changer, err := newPasswordChanger("mysql", passwordChangerConfig{
+		Client:     client,
+		Namespace:  "default",
+		Database:   "mysql",
+		Container:  "mysql",
+		Pod:        &pod,
+		Output:     io.Discard,
+		JobTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("newPasswordChanger() error = %v", err)
+	}
+
+	if err = changer.ChangePassword(passwordChangeRequest{
+		AuthUser:          "root",
+		AuthPassword:      "admin-password",
+		TargetUser:        "appuser",
+		TargetOldPassword: "target-old-secret",
+		NewPassword:       "new-password",
+	}); err != nil {
+		t.Fatalf("ChangePassword() error = %v", err)
+	}
+
+	job := createdPasswordJob(t, client)
+	if job == nil {
+		t.Fatal("temporary password Job was not created")
+	}
+	command := job.Spec.Template.Spec.Containers[0].Command
+	if len(command) != 3 || command[0] != "sh" || command[1] != "-c" ||
+		!strings.Contains(command[2], "mysql") || !strings.Contains(command[2], passwordJobScriptMountPath+"/script.sql") {
+		t.Fatalf("temporary MySQL Job command = %v, want a shell command that reads the mounted SQL script", command)
+	}
+	jobObject := string(mustMarshalJSON(t, job))
+	for _, password := range []string{"admin-password", "target-old-secret", "new-password"} {
+		if strings.Contains(jobObject, password) {
+			t.Fatalf("temporary Job contains plaintext password %q", password)
+		}
+	}
+
+	scriptSecret := createdPasswordSecret(t, client)
+	if scriptSecret.Name != job.Name {
+		t.Fatalf("temporary Secret name = %q, want Job name %q", scriptSecret.Name, job.Name)
+	}
+	if string(scriptSecret.Data["username"]) != "root" || string(scriptSecret.Data["password"]) != "admin-password" {
+		t.Fatal("temporary MySQL Secret does not contain the supplied credentials")
+	}
+	if !strings.Contains(string(scriptSecret.Data[passwordJobScriptKey]), `ALTER USER 'appuser'@'%'`) {
+		t.Fatal("temporary MySQL Secret does not contain the password-change SQL")
+	}
+	assertPasswordJobSecretEnv(t, job, "MYSQL_USER", "username")
+	assertPasswordJobSecretEnv(t, job, "MYSQL_PWD", "password")
+	assertNoPasswordExec(t, client)
+	assertTemporaryPasswordResourcesDeleted(t, client, job.Name)
+}
+
+func TestRedisPasswordChangerUsesTemporaryJobWithoutExec(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	completePasswordJobsImmediately(client)
+	pod := passwordTestPod("redis-redis-0", "master", "redis")
+	pod.Namespace = "default"
+	pod.Status.PodIP = "10.0.0.11"
+	pod.Spec.Containers = []corev1.Container{{Name: "redis", Image: "redis:test"}}
+
+	changer, err := newPasswordChanger("redis", passwordChangerConfig{
+		Client:     client,
+		Namespace:  "default",
+		Database:   "0",
+		Container:  "redis",
+		Pod:        &pod,
+		Output:     io.Discard,
+		JobTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("newPasswordChanger() error = %v", err)
+	}
+
+	if err = changer.ChangePassword(passwordChangeRequest{
+		AuthUser:          "default",
+		AuthPassword:      "admin-password",
+		TargetUser:        "default",
+		TargetOldPassword: "target-old-secret",
+		NewPassword:       "new-password",
+	}); err != nil {
+		t.Fatalf("ChangePassword() error = %v", err)
+	}
+
+	job := createdPasswordJob(t, client)
+	if job == nil {
+		t.Fatal("temporary password Job was not created")
+	}
+	command := job.Spec.Template.Spec.Containers[0].Command
+	if len(command) != 3 || command[0] != "sh" || command[1] != "-c" ||
+		!strings.Contains(command[2], "redis-cli") || !strings.Contains(command[2], "/change-password/password") {
+		t.Fatalf("temporary Redis Job command = %v, want a shell command that reads the mounted password", command)
+	}
+	jobObject := string(mustMarshalJSON(t, job))
+	for _, password := range []string{"admin-password", "target-old-secret", "new-password"} {
+		if strings.Contains(jobObject, password) {
+			t.Fatalf("temporary Job contains plaintext password %q", password)
+		}
+	}
+
+	scriptSecret := createdPasswordSecret(t, client)
+	if scriptSecret.Name != job.Name {
+		t.Fatalf("temporary Secret name = %q, want Job name %q", scriptSecret.Name, job.Name)
+	}
+	if string(scriptSecret.Data[passwordJobScriptKey]) != ">new-password" {
+		t.Fatalf("temporary Redis password rule = %q, want %q", scriptSecret.Data[passwordJobScriptKey], ">new-password")
+	}
+	if string(scriptSecret.Data["auth-password"]) != "admin-password" || string(scriptSecret.Data["old-password"]) != "target-old-secret" {
+		t.Fatal("temporary Redis Secret does not contain authentication and rollback passwords")
+	}
+	assertPasswordJobSecretEnv(t, job, "REDIS_USER", "auth-user")
+	assertPasswordJobSecretEnv(t, job, "REDISCLI_AUTH", "auth-password")
+	assertPasswordJobSecretEnv(t, job, "REDIS_TARGET_USER", "target-user")
+	assertPasswordJobSecretEnv(t, job, "REDIS_OLD_PASSWORD", "old-password")
+	assertNoPasswordExec(t, client)
+	assertTemporaryPasswordResourcesDeleted(t, client, job.Name)
+}
+
 func TestPostgresPasswordChangerSupportsExecExecutor(t *testing.T) {
 	client := fake.NewSimpleClientset()
 	pod := passwordTestPod("pg-postgresql-0", "primary", "postgresql")
@@ -727,6 +940,96 @@ func TestMongoPasswordChangerSupportsExecExecutor(t *testing.T) {
 	assertExecQueryValues(t, executor.url, "command", []string{"sh", "-c"})
 	if !strings.Contains(executor.stdin.String(), `updateUser: "appuser"`) {
 		t.Fatalf("exec stdin does not contain the MongoDB change: %q", executor.stdin.String())
+	}
+	assertNoPasswordJobResources(t, client)
+}
+
+func TestMySQLPasswordChangerSupportsExecExecutor(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	pod := passwordTestPod("mysql-mysql-0", "leader", "mysql")
+	pod.Namespace = "default"
+	pod.Spec.Containers = []corev1.Container{{Name: "mysql", Image: "apecloud/mysql:test"}}
+	executor := &recordingPasswordExecutor{}
+	changer, err := newPasswordChanger("mysql", passwordChangerConfig{
+		Client:        client,
+		Namespace:     "default",
+		Database:      "mysql",
+		Container:     "mysql",
+		Pod:           &pod,
+		Config:        &rest.Config{},
+		RESTClient:    passwordExecRESTClient(t),
+		Executor:      executor,
+		ExecutionMode: passwordExecutionModeExec,
+		Output:        io.Discard,
+		JobTimeout:    time.Second,
+	})
+	if err != nil {
+		t.Fatalf("newPasswordChanger() error = %v", err)
+	}
+
+	if err = changer.ChangePassword(passwordChangeRequest{
+		PodName:           pod.Name,
+		AuthUser:          "root",
+		AuthPassword:      "old-password",
+		TargetUser:        "appuser",
+		TargetOldPassword: "old-password",
+		NewPassword:       "new-password",
+	}); err != nil {
+		t.Fatalf("ChangePassword() error = %v", err)
+	}
+
+	if executor.url == nil {
+		t.Fatal("exec executor was not invoked")
+	}
+	assertExecQueryValue(t, executor.url, "container", "mysql")
+	assertExecQueryValues(t, executor.url, "command", []string{"env", "mysql"})
+	if !strings.Contains(executor.stdin.String(), `ALTER USER 'appuser'@'%'`) {
+		t.Fatalf("exec stdin does not contain the MySQL change: %q", executor.stdin.String())
+	}
+	assertNoPasswordJobResources(t, client)
+}
+
+func TestRedisPasswordChangerSupportsExecExecutor(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	pod := passwordTestPod("redis-redis-0", "master", "redis")
+	pod.Namespace = "default"
+	pod.Spec.Containers = []corev1.Container{{Name: "redis", Image: "redis:test"}}
+	executor := &recordingPasswordExecutor{}
+	changer, err := newPasswordChanger("redis", passwordChangerConfig{
+		Client:        client,
+		Namespace:     "default",
+		Database:      "0",
+		Container:     "redis",
+		Pod:           &pod,
+		Config:        &rest.Config{},
+		RESTClient:    passwordExecRESTClient(t),
+		Executor:      executor,
+		ExecutionMode: passwordExecutionModeExec,
+		Output:        io.Discard,
+		JobTimeout:    time.Second,
+	})
+	if err != nil {
+		t.Fatalf("newPasswordChanger() error = %v", err)
+	}
+
+	if err = changer.ChangePassword(passwordChangeRequest{
+		PodName:           pod.Name,
+		AuthUser:          "default",
+		AuthPassword:      "old-password",
+		TargetUser:        "default",
+		TargetOldPassword: "old-password",
+		NewPassword:       "new-password",
+	}); err != nil {
+		t.Fatalf("ChangePassword() error = %v", err)
+	}
+
+	if executor.url == nil {
+		t.Fatal("exec executor was not invoked")
+	}
+	assertExecQueryValue(t, executor.url, "container", "redis")
+	assertExecQueryValues(t, executor.url, "command", []string{"redis-cli", "--raw"})
+	if executor.stdin.String() != ">new-password" {
+		t.Fatalf("exec stdin = %q, want the new Redis password rule", executor.stdin.String())
 	}
 	assertNoPasswordJobResources(t, client)
 }
@@ -842,6 +1145,19 @@ func assertNoPasswordJobResources(t *testing.T, client *fake.Clientset) {
 			t.Fatalf("exec mode created a temporary resource: %v", action)
 		}
 	}
+}
+
+func assertPasswordJobSecretEnv(t *testing.T, job *batchv1.Job, name, key string) {
+	t.Helper()
+	for _, env := range job.Spec.Template.Spec.Containers[0].Env {
+		if env.Name != name || env.ValueFrom == nil || env.ValueFrom.SecretKeyRef == nil {
+			continue
+		}
+		if env.ValueFrom.SecretKeyRef.Name == job.Name && env.ValueFrom.SecretKeyRef.Key == key {
+			return
+		}
+	}
+	t.Fatalf("temporary Job does not load %s from temporary Secret key %s", name, key)
 }
 
 func assertNoPasswordExec(t *testing.T, client *fake.Clientset) {
