@@ -89,8 +89,12 @@ var (
 		kbcli cluster change-password CLUSTERNAME
 		# change the default MongoDB root password and update its Secret
 		kbcli cluster change-password CLUSTERNAME --password PASSWD
+		# change the default MySQL root or Redis default password and update its Secret
+		kbcli cluster change-password CLUSTERNAME --password PASSWD
 		# change an application role password with explicit Secrets
 		kbcli cluster change-password CLUSTERNAME --component COMPNAME --name USERNAME --password PASSWD --secret TARGET_SECRET --auth-secret ADMIN_SECRET
+		# change a password and rolling restart the component afterwards
+		kbcli cluster change-password CLUSTERNAME --password PASSWD --restart
 		# change a password on a specified instance
 		kbcli cluster change-password --instance INSTANCE --name USERNAME --password PASSWD
  `)
@@ -205,8 +209,12 @@ func NewRevokeOptions(f cmdutil.Factory, streams genericiooptions.IOStreams) *co
 func NewChangePasswordCmd(f cmdutil.Factory, streams genericiooptions.IOStreams) *cobra.Command {
 	o := accounts.NewChangePasswordOptions(f, streams)
 	cmd := &cobra.Command{
-		Use:               "change-password",
-		Short:             "Change a database account password",
+		Use:   "change-password",
+		Short: "Change a database account password",
+		Long: `Change a database account password and update its related Secrets.
+For Redis, ACL state is local to each Pod; the ACL is rotated and saved on every
+Running Pod in the selected component. Use --restart to refresh in-Pod clients
+that still hold the previous default-account credential in their environment.`,
 		Example:           changePasswordExamples,
 		ValidArgsFunction: util.ResourceNameCompletionFunc(f, types.ClusterGVR()),
 		Run: func(cmd *cobra.Command, args []string) {
