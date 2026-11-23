@@ -39,6 +39,23 @@ var _ = Describe("helper", func() {
 		Expect(len(infos) == 1).Should(BeTrue())
 	})
 
+	It("fill component info from component definition", func() {
+		cluster := testing.FakeCluster("test", "test")
+		cluster.Spec.ClusterDefRef = ""
+		cluster.Spec.ComponentSpecs[0].ComponentDefRef = ""
+		cluster.Spec.ComponentSpecs[0].ComponentDef = testing.CompDefName
+
+		componentDef := testing.FakeCompDef()
+		componentDef.Spec.ServiceKind = "mongodb"
+		dynamic := testing.FakeDynamicClient(cluster, componentDef)
+
+		compInfo, err := FillCompInfoByName(dynamic, "test", "test", "")
+		Expect(err).Should(Succeed())
+		Expect(compInfo).ShouldNot(BeNil())
+		Expect(compInfo.ComponentDef.Name).Should(Equal(testing.CompDefName))
+		Expect(compInfo.ComponentDef.CharacterType).Should(Equal("mongodb"))
+	})
+
 	It("find component in cluster by name", func() {
 		cluster := testing.FakeCluster("test", "test")
 		component := FindClusterComp(cluster, "test")
