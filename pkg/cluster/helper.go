@@ -344,6 +344,23 @@ func FillCompInfoByName(dynamic dynamic.Interface, namespace, clusterName, compo
 		return nil, fmt.Errorf("componentStatus %s not found in cluster %s", componentName, clusterName)
 	}
 
+	// ComponentDefinition takes precedence when both componentDef and
+	// componentDefRef are provided, matching the behavior of other commands.
+	if compInfo.Component.ComponentDef != "" {
+		componentDef, err := GetComponentDefByName(dynamic, compInfo.Component.ComponentDef)
+		if err != nil {
+			return nil, err
+		}
+		compInfo.ComponentDef = &appsv1alpha1.ClusterComponentDefinition{
+			Name:          componentDef.Name,
+			CharacterType: componentDef.Spec.ServiceKind,
+		}
+		return compInfo, nil
+	}
+
+	if cluster.Spec.ClusterDefRef == "" {
+		return nil, fmt.Errorf("cluster %s has neither componentDef nor clusterDefRef", clusterName)
+	}
 	// find cluster def
 	clusterDef, err := GetClusterDefByName(dynamic, cluster.Spec.ClusterDefRef)
 	if err != nil {
@@ -351,11 +368,7 @@ func FillCompInfoByName(dynamic dynamic.Interface, namespace, clusterName, compo
 	}
 	// find component def by reference
 	for _, compDef := range clusterDef.Spec.ComponentDefs {
-		compRefName := compInfo.Component.ComponentDefRef
-		if len(compRefName) == 0 {
-			compRefName = compInfo.Component.ComponentDef
-		}
-		if compDef.Name == compRefName {
+		if compDef.Name == compInfo.Component.ComponentDefRef {
 			compInfo.ComponentDef = &compDef
 			break
 		}
